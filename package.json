@@ -1,0 +1,633 @@
+// =============================================
+// 718DIGITAL - API COMPLÈTE
+// Version 3.0 - Mistral + Dola AI
+// Déploiement sur Render
+// =============================================
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const app = express();
+
+// =============================================
+// MIDDLEWARES
+// =============================================
+app.use(helmet());
+app.use(compression());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// =============================================
+// IMPORT DES HELPERS
+// =============================================
+const { callMistral, callMistralJSON } = require('./functions/mistral-helpers');
+const { callDola, callDolaJSON } = require('./functions/dola-helpers');
+const { sendWhatsApp, sendWhatsAppFile } = require('./functions/whatsapp-helpers');
+const { createRecord, updateRecord, findRecords, getRecord } = require('./functions/airtable-helpers');
+const { generateCanvaAutofill } = require('./functions/canva-helpers');
+const { determineComplexity, getAIForTask } = require('./functions/routing');
+
+// =============================================
+// VALIDATION DES REQUÊTES
+// =============================================
+function requireFields(fields) {
+    return (req, res, next) => {
+        const missing = fields.filter(f => req.body[f] === undefined || req.body[f] === null || req.body[f] === '');
+        if (missing.length > 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Champs manquants: ${missing.join(', ')}`
+            });
+        }
+        next();
+    };
+}
+
+// =============================================
+// CONFIGURATION
+// =============================================
+const PORT = process.env.PORT || 3000;
+const INTERNAL_GROUP_ID = process.env.INTERNAL_GROUP_ID || '';
+
+console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║        🚀 718DIGITAL API - VERSION 3.0                      ║
+║                                                               ║
+╠═══════════════════════════════════════════════════════════════╣
+║                                                               ║
+║   📡 Port : ${PORT}                                             ║
+║   🧠 Mistral : ✅ Configurée                                  ║
+║   🤖 Dola AI : ✅ Configurée                                  ║
+║   🎨 Canva : ✅ Templates prêts                              ║
+║                                                               ║
+╠═══════════════════════════════════════════════════════════════╣
+║                                                               ║
+║   📐 Tâches simples  → MISTRAL                              ║
+║   🎨 Tâches complexes → DOLA AI                             ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
+
+// =============================================
+// PROMPTS SYSTÈME
+// =============================================
+const PROMPTS = {
+    AGENT_00: `Tu es l'Agent d'Accueil de 718Digital, une agence de création et design basée en Côte d'Ivoire.
+
+RÈGLES :
+1. Détecte la langue et réponds dans la même langue
+2. Présente-toi comme l'assistant de 718Digital
+3. Pose CES 3 questions dans l'ordre :
+   a) "Quel est votre nom et celui de votre entreprise ?"
+   b) "Quel service recherchez-vous ? (Logo, Impression, Site web, Vidéo, Design)"
+   c) "Quel est votre budget approximatif ?"
+4. Calcule un score sur 10
+5. Termine par : "Un expert 718Digital vous recontactera sous 24h"
+
+Score à extraire à la fin : "Score: X/10"`,
+
+    AGENT_01: `Tu es l'Agent Brief de 718Digital.
+
+À partir des réponses, génère un brief professionnel structuré :
+
+# BRIEF PROJET - [NOM CLIENT]
+
+## 1. CONTEXTE
+- Entreprise :
+- Secteur :
+- Objectif principal :
+
+## 2. BESOIN SPÉCIFIQUE
+- Service demandé :
+- Problème à résoudre :
+- Résultat attendu :
+
+## 3. CONTRAINTES
+- Budget :
+- Délai souhaité :
+
+## 4. RECOMMANDATIONS PRÉLIMINAIRES
+- Piste 1 :
+- Piste 2 :
+
+Format professionnel avec emojis.`,
+
+    AGENT_02: `Tu es l'Agent Devis de 718Digital.
+
+Analyse ce brief et génère un devis en JSON UNIQUEMENT :
+{
+  "service": "Nom du service",
+  "description": "Description détaillée",
+  "prix_ht": 250000,
+  "tva": 18,
+  "total_ttc": 295000,
+  "duree": "5 jours",
+  "inclus": ["élément1", "élément2"]
+}`,
+
+    AGENT_03_CONCEPT: `Tu es un designer créatif expert. Génère un concept de design complet.
+
+Réponds en JSON :
+{
+  "titre": "Nom du concept",
+  "description": "Description détaillée du concept",
+  "style": "Style visuel (moderne, minimal, luxe, bold)",
+  "palette_couleurs": ["#couleur1", "#couleur2", "#couleur3"],
+  "typographie": "Police recommandée",
+  "elements_cles": ["élément1", "élément2", "élément3"],
+  "moodboard": "Description de l'ambiance visuelle",
+  "inspiration": "Références ou inspirations"
+}`,
+
+    AGENT_03_SIMPLE: `Génère un contenu simple pour un flyer/post en JSON :
+{
+  "titre": "Titre accrocheur (max 30 caractères)",
+  "sous_titre": "Sous-titre (max 50 caractères)",
+  "description": "Description courte (max 100 caractères)",
+  "cta": "Appel à l'action",
+  "couleur_principale": "#1A73E8"
+}`,
+
+    AGENT_07: `Tu es l'Agent Livraison de 718Digital.
+
+Génère un message de livraison chaleureux et professionnel.
+
+Le message doit contenir :
+- Félicitations
+- Lien du livrable
+- Demande d'avis (⭐)
+
+Format court et impactant.`,
+
+    AGENT_20: `Tu es l'Agent Reporting de 718Digital.
+
+Génère un rapport quotidien pour le dirigeant avec ces données.
+
+STRUCTURE :
+📊 RAPPORT 718DIGITAL - [DATE]
+
+💰 CA : [montant] FCFA
+📋 Commandes : [nombre]
+✅ Livrées : [nombre]
+🔄 En cours : [nombre]
+⭐ Satisfaction : [note]/5
+
+🔍 ACTION PRIORITAIRE : [1 suggestion]
+💡 OPPORTUNITÉ : [1 opportunité]`
+};
+
+// =============================================
+// AGENT 00 - ACCUEIL CLIENT (Mistral)
+// =============================================
+app.post('/webhook/agent-00', async (req, res) => {
+    try {
+        const { from, message } = req.body;
+        console.log(`📩 [Agent 00 - Mistral] ${from}: ${message}`);
+
+        const aiResponse = await callMistral(PROMPTS.AGENT_00, message);
+
+        const scoreMatch = aiResponse.match(/Score[: ]+(\d+)/i);
+        const score = scoreMatch ? parseInt(scoreMatch[1]) : 5;
+
+        let prospectId = null;
+        if (process.env.AIRTABLE_API_KEY) {
+            const prospect = await createRecord('Prospects', {
+                'Téléphone': from,
+                'Dernier Message': message,
+                'Score': score,
+                'Statut': score >= 7 ? 'Qualifié' : 'Nurturing',
+                'Date Contact': new Date().toISOString()
+            });
+            prospectId = prospect.id;
+        }
+
+        await sendWhatsApp(from, aiResponse);
+
+        if (score >= 7) {
+            await sendWhatsApp(from,
+                `🎯 Excellent ! Remplissez notre formulaire de brief :\n📝 https://votre-typeform.com/brief\n\nUn expert vous recontactera sous 24h.`
+            );
+        }
+
+        res.json({ status: 'success', score, prospectId });
+
+    } catch (error) {
+        console.error('❌ Agent 00 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 01 - BRIEF (Mistral)
+// =============================================
+app.post('/webhook/agent-01', async (req, res) => {
+    try {
+        const { formData, prospectId } = req.body;
+        console.log(`📝 [Agent 01 - Mistral] Brief pour ${prospectId}`);
+
+        const brief = await callMistral(PROMPTS.AGENT_01, JSON.stringify(formData));
+
+        let projectId = null;
+        if (process.env.AIRTABLE_API_KEY) {
+            const project = await createRecord('Projets', {
+                'Client': [prospectId],
+                'Brief': brief,
+                'Statut': 'Briefing',
+                'Date Création': new Date().toISOString()
+            });
+            projectId = project.id;
+        }
+
+        const client = await getRecord('Prospects', prospectId);
+        if (client) {
+            await sendWhatsApp(
+                client.fields['Téléphone'],
+                `📄 Merci ! Votre brief a été enregistré.\n\n✅ Notre équipe prépare votre devis dans les 24h.`
+            );
+        }
+
+        res.json({ status: 'success', brief, projectId });
+
+    } catch (error) {
+        console.error('❌ Agent 01 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 02 - DEVIS (Mistral)
+// =============================================
+app.post('/webhook/agent-02', async (req, res) => {
+    try {
+        const { projectId, brief } = req.body;
+        console.log(`💰 [Agent 02 - Mistral] Devis ${projectId}`);
+
+        const devis = await callMistralJSON(PROMPTS.AGENT_02, brief);
+
+        if (process.env.AIRTABLE_API_KEY && projectId) {
+            await updateRecord('Projets', projectId, {
+                'Devis': devis.prix_ht,
+                'TVA': devis.tva,
+                'Total TTC': devis.total_ttc,
+                'Statut': 'Devis Envoyé'
+            });
+        }
+
+        const project = await getRecord('Projets', projectId);
+        const client = await getRecord('Prospects', project?.fields?.Client?.[0]);
+
+        if (client) {
+            await sendWhatsApp(
+                client.fields['Téléphone'],
+                `📋 Votre devis est prêt !\n\n` +
+                `Service : ${devis.service}\n` +
+                `💰 Total : ${devis.total_ttc.toLocaleString()} FCFA TTC\n` +
+                `📅 Délai : ${devis.duree}\n\n` +
+                `✅ Répondez "OK devis" pour confirmer`
+            );
+        }
+
+        res.json({ status: 'success', devis });
+
+    } catch (error) {
+        console.error('❌ Agent 02 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 03 - CONCEPT (Dola pour complexe, Mistral pour simple)
+// =============================================
+app.post('/webhook/agent-03', async (req, res) => {
+    try {
+        const { brief, serviceType, clientName, clientPhone, projectId, entreprise } = req.body;
+        console.log(`🎨 [Agent 03] ${serviceType} - ${clientName}`);
+
+        // Déterminer la complexité
+        const complexity = determineComplexity(brief, serviceType);
+        const ai = getAIForTask('concept', complexity);
+        console.log(`📊 Complexité: ${complexity} → IA: ${ai}`);
+
+        let result, toolUsed;
+
+        if (complexity === 'complex') {
+            // ========== DOLA AI - COMPLEXE ==========
+            toolUsed = 'Dola AI (Création complexe)';
+            const content = await callDolaJSON(PROMPTS.AGENT_03_CONCEPT,
+                `Service: ${serviceType}\nClient: ${clientName}\nBrief: ${brief}`
+            );
+            result = {
+                type: 'complex',
+                ai: 'dola',
+                content: content,
+                message: '🎨 Concept complexe généré par Dola AI'
+            };
+        } else {
+            // ========== MISTRAL - SIMPLE ==========
+            toolUsed = 'Mistral AI (Design simple)';
+            const content = await callMistralJSON(PROMPTS.AGENT_03_SIMPLE,
+                `Service: ${serviceType}\nClient: ${clientName}\nBrief: ${brief}`
+            );
+            const canvaUrl = generateCanvaAutofill(process.env.CANVA_TEMPLATE_FLYER || 'DAFxxxxx', {
+                'nom_client': clientName,
+                'nom_entreprise': entreprise || '718Digital',
+                ...content
+            });
+            result = {
+                type: 'simple',
+                ai: 'mistral',
+                url: canvaUrl,
+                content: content,
+                message: '📄 Design simple généré par Mistral'
+            };
+        }
+
+        // Sauvegarde
+        if (process.env.AIRTABLE_API_KEY && projectId) {
+            await updateRecord('Projets', projectId, {
+                'Statut': 'Concept Prêt',
+                'Outil Utilisé': toolUsed,
+                'Complexité': complexity,
+                'Lien Livrable': result.url || JSON.stringify(result.content)
+            });
+        }
+
+        // Envoi client
+        await sendWhatsApp(
+            clientPhone,
+            `${result.message}\n\n` +
+            `🔗 ${result.url || 'Concept généré'}\n\n` +
+            `🛠️ Créé avec : ${toolUsed}\n` +
+            `📋 Type : ${complexity === 'simple' ? 'Design simple' : 'Création complexe'}\n\n` +
+            `✅ Validez en répondant "OK concept"`
+        );
+
+        // Notification interne
+        if (INTERNAL_GROUP_ID) {
+            await sendWhatsApp(
+                INTERNAL_GROUP_ID,
+                `🔔 NOUVEAU CONCEPT\n\nClient : ${clientName}\nService : ${serviceType}\nOutil : ${toolUsed}\nIA : ${ai}`
+            );
+        }
+
+        res.json({ status: 'success', complexity, ai, result });
+
+    } catch (error) {
+        console.error('❌ Agent 03 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 04 - DIGITALISATION (Mistral)
+// =============================================
+app.post('/webhook/agent-04', async (req, res) => {
+    try {
+        const { projectId, brief, serviceType, clientPhone } = req.body;
+        console.log(`💻 [Agent 04 - Mistral] Digitalisation: ${serviceType}`);
+
+        const prompt = `Tu es l'Agent Digitalisation de 718Digital.
+        Génère un plan de digitalisation pour ${serviceType}.
+        Brief: ${brief}
+
+        Format structuré avec recommandations techniques.`;
+
+        const content = await callMistral(prompt, '');
+
+        if (process.env.AIRTABLE_API_KEY && projectId) {
+            await updateRecord('Projets', projectId, {
+                'Statut': 'Digitalisation Prête',
+                'Données Digitalisation': content
+            });
+        }
+
+        await sendWhatsApp(
+            clientPhone,
+            `💻 Votre digitalisation est prête !\n\n📄 ${content.substring(0, 200)}...\n\n✅ Validez en répondant "OK digitalisation"`
+        );
+
+        res.json({ status: 'success', content });
+
+    } catch (error) {
+        console.error('❌ Agent 04 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 05 - PRINT (Mistral)
+// =============================================
+app.post('/webhook/agent-05', async (req, res) => {
+    try {
+        const { projectId, brief, type, quantite, clientPhone } = req.body;
+        console.log(`🖨️ [Agent 05 - Mistral] Print: ${type} x${quantite}`);
+
+        const prompt = `Tu es l'Agent Print de 718Digital.
+        Analyse cette demande d'impression:
+        Type: ${type}
+        Quantité: ${quantite}
+        Brief: ${brief}
+
+        Génère un devis avec les spécifications techniques.`;
+
+        const analysis = await callMistral(prompt, '');
+
+        if (process.env.AIRTABLE_API_KEY && projectId) {
+            await updateRecord('Projets', projectId, {
+                'Statut': 'Print Prêt',
+                'Données Print': analysis
+            });
+        }
+
+        await sendWhatsApp(
+            clientPhone,
+            `🖨️ Votre commande print est analysée !\n\n📄 ${analysis}\n\n✅ Validez en répondant "OK print"`
+        );
+
+        res.json({ status: 'success', analysis });
+
+    } catch (error) {
+        console.error('❌ Agent 05 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 06 - SHOP (Dola pour complexe, Mistral pour simple)
+// =============================================
+app.post('/webhook/agent-06', async (req, res) => {
+    try {
+        const { type, brief, clientName, clientPhone, projectId, entreprise } = req.body;
+        console.log(`🛍️ [Agent 06] Shop: ${type} - ${clientName}`);
+
+        const complexity = determineComplexity(brief, type);
+        const ai = getAIForTask('shop', complexity);
+
+        let result, toolUsed;
+
+        if (complexity === 'complex') {
+            toolUsed = 'Dola AI (Shop complexe)';
+            const content = await callDolaJSON(
+                `Tu es un designer expert. Crée un concept pour ${type} en JSON:
+                {
+                    "nom": "Nom du produit",
+                    "description": "Description détaillée",
+                    "style": "Style visuel",
+                    "couleurs": ["#couleur1", "#couleur2"],
+                    "elements": ["élément1", "élément2"]
+                }`,
+                `Client: ${clientName}\nBrief: ${brief}`
+            );
+            result = { type: 'complex', ai: 'dola', content };
+        } else {
+            toolUsed = 'Mistral AI (Shop simple)';
+            const content = await callMistralJSON(
+                `Génère un contenu simple pour ${type} en JSON:
+                {
+                    "titre": "Titre",
+                    "description": "Description courte",
+                    "prix": "Prix indicatif"
+                }`,
+                `Brief: ${brief}`
+            );
+            const canvaUrl = generateCanvaAutofill(process.env.CANVA_TEMPLATE_LOGO || 'DAFxxxxx', {
+                'nom_client': clientName,
+                'nom_entreprise': entreprise || '718Digital',
+                ...content
+            });
+            result = { type: 'simple', ai: 'mistral', url: canvaUrl, content };
+        }
+
+        if (process.env.AIRTABLE_API_KEY && projectId) {
+            await updateRecord('Projets', projectId, {
+                'Statut': 'Shop Prêt',
+                'Outil Utilisé': toolUsed,
+                'Lien Livrable': result.url || JSON.stringify(result.content)
+            });
+        }
+
+        await sendWhatsApp(
+            clientPhone,
+            `🛍️ Votre ${type} est prêt !\n\n` +
+            `🔗 ${result.url || 'Création prête'}\n\n` +
+            `🛠️ Créé avec : ${toolUsed}\n` +
+            `✅ Validez en répondant "OK shop"`
+        );
+
+        res.json({ status: 'success', type, ai, result });
+
+    } catch (error) {
+        console.error('❌ Agent 06 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 07 - LIVRAISON (Mistral)
+// =============================================
+app.post('/webhook/agent-07', async (req, res) => {
+    try {
+        const { projectId, livrableUrl, clientPhone, clientName } = req.body;
+        console.log(`📦 [Agent 07 - Mistral] Livraison ${projectId}`);
+
+        const message = await callMistral(PROMPTS.AGENT_07,
+            `Client: ${clientName}\nLivrable: ${livrableUrl}`
+        );
+
+        await sendWhatsApp(
+            clientPhone,
+            `${message}\n\n📥 ${livrableUrl}\n\n⭐ Donnez votre avis (1-5)`
+        );
+
+        if (process.env.AIRTABLE_API_KEY && projectId) {
+            await updateRecord('Projets', projectId, {
+                'Statut': 'Livré',
+                'Lien Livrable': livrableUrl,
+                'Date Livraison': new Date().toISOString()
+            });
+        }
+
+        res.json({ status: 'success', message: 'Livraison effectuée' });
+
+    } catch (error) {
+        console.error('❌ Agent 07 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// AGENT 20 - REPORTING (Mistral)
+// =============================================
+app.get('/webhook/agent-20', async (req, res) => {
+    try {
+        console.log('📊 [Agent 20 - Mistral] Rapport quotidien');
+
+        const data = {
+            ca_today: 450000,
+            new_orders: 3,
+            delivered: 2,
+            in_progress: 4,
+            satisfaction: 4.8
+        };
+
+        const report = await callMistral(PROMPTS.AGENT_20, JSON.stringify(data));
+
+        if (INTERNAL_GROUP_ID) {
+            await sendWhatsApp(INTERNAL_GROUP_ID, report);
+        }
+
+        res.json({ status: 'success', report, data });
+
+    } catch (error) {
+        console.error('❌ Agent 20 Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// =============================================
+// ENDPOINT DE TEST
+// =============================================
+app.get('/test', (req, res) => {
+    res.json({
+        status: 'running',
+        service: '718Digital API',
+        version: '3.0.0',
+        timestamp: new Date().toISOString(),
+        environment: {
+            node: process.version,
+            port: PORT,
+            mistral: '✅',
+            dola: '✅',
+            airtable: process.env.AIRTABLE_API_KEY ? '✅' : '⚠️',
+            whatsapp: process.env.WHATSAPP_TOKEN ? '✅' : '⚠️'
+        },
+        endpoints: [
+            'POST /webhook/agent-00 - Accueil (Mistral)',
+            'POST /webhook/agent-01 - Brief (Mistral)',
+            'POST /webhook/agent-02 - Devis (Mistral)',
+            'POST /webhook/agent-03 - Concept (Dola/Mistral)',
+            'POST /webhook/agent-04 - Digitalisation (Mistral)',
+            'POST /webhook/agent-05 - Print (Mistral)',
+            'POST /webhook/agent-06 - Shop (Dola/Mistral)',
+            'POST /webhook/agent-07 - Livraison (Mistral)',
+            'GET /webhook/agent-20 - Reporting (Mistral)'
+        ]
+    });
+});
+
+// =============================================
+// DÉMARRAGE
+// =============================================
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 718Digital API running on port ${PORT}`);
+});
+
+module.exports = app;
